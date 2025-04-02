@@ -1,50 +1,51 @@
-import cv2
-import subprocess
-import numpy as np
+import base64
+import io
+from flask import Flask
+from flask_socketio import SocketIO, emit
+from PIL import Image
+from ultralytics import YOLO
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'secret!'
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+model = YOLO('yolov12n.pt')
+
+@socketio.on('connect')
+def on_connect():
+    print("客户端已连接")
+    emit('message', {'data': '连接成功'})
+
+@socketio.on('disconnect')
+def on_disconnect():
+    print("客户端已断开连接")
 
 
-def main():
-    # RTMP流地址（需与Flutter前端一致）
-    rtmp_url = "rtmp://192.168.6.120:1935/live/stream"
-
-    # 方法1：直接使用OpenCV（需OpenCV支持FFmpeg）
+@socketio.on('image')
+def handle_image(data):
+    """
+    前端需要发送 Base64 编码后的图像字符串。
+    检测流程：
+      1. 解码 Base64 数据，生成 PIL Image 对象
+      2. 调用 YOLO 模型进行检测
+      3. 将检测结果转换为 JSON 格式并返回前端
+    """
     try:
-        cap = cv2.VideoCapture(rtmp_url)
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("无法读取帧，检查流地址是否正确！")
-                break
-            cv2.imshow("Real-time Stream", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-        cap.release()
+        image_data = data.get("image", "")
+        if image_data.startswith("data:image"):
+            header, image_data = image_data.split(",", 1)
+        img_bytes = base64.b64decode(image_data)
+        image = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+
+        results = model(image)
+
+        detections = results.pandas().xyxy[0].to_dict(orient="records")
+
+        emit('detections', {'detections': detections})
     except Exception as e:
-        print(f"OpenCV直接读取失败：{e}\n尝试使用FFmpeg管道方法...")
-
-        # 方法2：通过FFmpeg管道读取（通用方法）
-        width, height = 640, 480  # 假设前端推流分辨率为640x480
-        command = [
-            'ffmpeg',
-            '-i', rtmp_url,
-            '-f', 'rawvideo',
-            '-pix_fmt', 'bgr24',
-            '-'
-        ]
-        pipe = subprocess.Popen(command, stdout=subprocess.PIPE, bufsize=10 ** 8)
-
-        while True:
-            raw_frame = pipe.stdout.read(width * height * 3)
-            if len(raw_frame) == 0:
-                break
-            frame = np.frombuffer(raw_frame, dtype='uint8').reshape((height, width, 3))
-            cv2.imshow("Real-time Stream (FFmpeg)", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-        pipe.terminate()
-
-    cv2.destroyAllWindows()
+        print("检测过程中发生错误:", e)
+        emit('error', {'error': str(e)})
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    socketio.run(app, host='0.0.0.0', port=5000,allow_unsafe_werkzeug=True)
